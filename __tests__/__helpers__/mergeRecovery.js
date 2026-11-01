@@ -7,6 +7,7 @@ import {
   init,
   merge,
   readBlob,
+  setConfig,
   writeBlob,
   writeCommit,
   writeRef,
@@ -201,6 +202,7 @@ export function testMergeRecovery(makeFixture) {
                 : { alias: file('remote-target', '120000') },
           })
           const filepath = `${fixture.dir}/alias`
+          await setConfig({ ...fixture, path: 'core.symlinks', value: true })
           await fixture.fs.rm(filepath)
           await fixture.fs.write(filepath, 'local-target')
 
@@ -238,6 +240,64 @@ export function testMergeRecovery(makeFixture) {
                 expect(index.entriesMap.get('alias').mode).toBe(0o120000)
               }
             )
+          }
+        })
+      }
+    }
+
+    for (const operation of ['update', 'delete']) {
+      for (const { target, content, autocrlf } of [
+        { target: 'local-target', content: 'local-target', autocrlf: false },
+        { target: 'local-target', content: 'edited-target', autocrlf: false },
+        {
+          target: 'local\r\ntarget',
+          content: 'local\r\ntarget',
+          autocrlf: true,
+        },
+        { target: 'local\ntarget', content: 'local\r\ntarget', autocrlf: true },
+      ]) {
+        it(`handles a symlink stub during checkout ${operation} (nonBlocking=${nonBlocking}, clean=${target === content}, autocrlf=${autocrlf})`, async () => {
+          const fixture = await prepare(makeFixture, {
+            base: { alias: file(target, '120000') },
+            ours: { alias: file(target, '120000') },
+            theirs:
+              operation === 'delete'
+                ? {}
+                : { alias: file('remote-target', '120000') },
+          })
+          await setConfig({ ...fixture, path: 'core.symlinks', value: false })
+          await setConfig({
+            ...fixture,
+            path: 'core.autocrlf',
+            value: autocrlf,
+          })
+          const filepath = `${fixture.dir}/alias`
+          await fixture.fs.rm(filepath)
+          await fixture.fs.write(filepath, content)
+          const indexPath = `${fixture.gitdirsmfullpath || fixture.gitdir}/index`
+          const index = await fixture.fs.read(indexPath)
+          const options = { ...fixture, ref: 'incoming', nonBlocking }
+          const result = checkout({ ...options, dryRun: true })
+          if (content === target) {
+            await result
+          } else {
+            await expect(result).rejects.toMatchObject({
+              code: Errors.CheckoutConflictError.code,
+              data: { filepaths: ['alias'] },
+            })
+          }
+          expect(await fixture.fs.read(indexPath)).toEqual(index)
+          expect((await fixture.fs.lstat(filepath)).isFile()).toBe(true)
+          expect((await fixture.fs.read(filepath)).toString()).toBe(content)
+          if (content === target) {
+            await checkout(options)
+            if (operation === 'delete') {
+              expect(await fixture.fs.exists(filepath)).toBe(false)
+            } else {
+              expect((await fixture.fs.readlink(filepath)).toString()).toBe(
+                'remote-target'
+              )
+            }
           }
         })
       }

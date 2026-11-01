@@ -13,6 +13,7 @@ import { NotFoundError } from '../errors/NotFoundError.js'
 import { GitConfigManager } from '../managers/GitConfigManager.js'
 import { GitIndexManager } from '../managers/GitIndexManager.js'
 import { GitRefManager } from '../managers/GitRefManager.js'
+import { hashObject } from '../storage/hashObject.js'
 import { _readObject as readObject } from '../storage/readObject.js'
 import { assertNoSymlinkInLeadingPath } from '../utils/assertNoSymlinkInLeadingPath.js'
 import { flat } from '../utils/flat.js'
@@ -20,6 +21,8 @@ import { resolveCommit } from '../utils/resolveCommit.js'
 import { worthWalking } from '../utils/worthWalking.js'
 
 const FILE_TYPE_MASK = 0o170000
+const REGULAR_FILE_TYPE = 0o100000
+const SYMLINK_MODE = 0o120000
 
 /**
  * @param {object} args
@@ -429,6 +432,8 @@ async function analyze({
   restoreFromIndex,
 }) {
   let count = 0
+  const config = await GitConfigManager.get({ fs, gitdir })
+  const symlinks = await config.get('core.symlinks')
   return _walk({
     fs,
     cache,
@@ -577,11 +582,14 @@ async function analyze({
               return ['rmdir-index', fullpath]
             }
             case 'blob': {
-              // Check types before hashing, which can refresh the index with workdir stats.
               if (
-                ((await stage.mode()) & FILE_TYPE_MASK) !==
-                  ((await workdir.mode()) & FILE_TYPE_MASK) ||
-                (await stage.oid()) !== (await workdir.oid())
+                await isWorkdirModified({
+                  fs,
+                  filepath: `${dir}/${fullpath}`,
+                  workdir,
+                  stage,
+                  symlinks,
+                })
               ) {
                 if (force) {
                   return ['delete', fullpath]
@@ -628,12 +636,15 @@ async function analyze({
               if (workdir) {
                 // Note: canonical git only compares with the stage. But we're smart enough
                 // to compare to the stage AND the incoming commit.
-                // Check types before hashing, which can refresh the index with workdir stats.
                 if (
-                  ((await workdir.mode()) & FILE_TYPE_MASK) !==
-                    ((await stage.mode()) & FILE_TYPE_MASK) ||
-                  ((await workdir.oid()) !== (await stage.oid()) &&
-                    (await workdir.oid()) !== (await commit.oid()))
+                  await isWorkdirModified({
+                    fs,
+                    filepath: `${dir}/${fullpath}`,
+                    workdir,
+                    stage,
+                    commit,
+                    symlinks,
+                  })
                 ) {
                   if (force) {
                     return [
@@ -731,6 +742,48 @@ async function updateIndex({ index, fullpath, stats, oid }) {
     console.warn(`Error inserting ${fullpath} into index:`, e)
   }
 }
+
+/**
+ * Detect local changes without refreshing the index for file-type mismatches or symlink stubs.
+ *
+ * @param {object} args
+ * @param {import('../models/FileSystem.js').FileSystem} args.fs
+ * @param {string} args.filepath Working-file path for reading stub bytes directly.
+ * @param {WalkerEntry} args.workdir
+ * @param {WalkerEntry} args.stage
+ * @param {WalkerEntry} [args.commit] Incoming contents that are also safe to overwrite.
+ * @param {boolean} [args.symlinks] Whether Git uses real symlinks; only explicit false permits stubs.
+ * @returns {Promise<boolean>}
+ */
+async function isWorkdirModified({
+  fs,
+  filepath,
+  workdir,
+  stage,
+  commit,
+  symlinks,
+}) {
+  const stageMode = await stage.mode()
+  const workdirType = (await workdir.mode()) & FILE_TYPE_MASK
+  if ((stageMode & FILE_TYPE_MASK) !== workdirType) {
+    if (
+      symlinks === false &&
+      stageMode === SYMLINK_MODE &&
+      workdirType === REGULAR_FILE_TYPE
+    ) {
+      // A stub's raw bytes must match the link target, without text conversion or index refresh.
+      const object = await fs.read(filepath)
+      const { oid } = await hashObject({ type: 'blob', object })
+      return oid !== (await stage.oid())
+    }
+    return true
+  }
+  const oid = await workdir.oid()
+  return (
+    oid !== (await stage.oid()) && (!commit || oid !== (await commit.oid()))
+  )
+}
+
 async function updateWorkingDir(
   { fs, cache, gitdir, dir },
   [method, fullpath, oid, mode, chmod]
