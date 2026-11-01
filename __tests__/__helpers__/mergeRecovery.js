@@ -189,6 +189,50 @@ export function testMergeRecovery(makeFixture) {
     expect(await fixture.fs.exists(`${fixture.dir}/added`)).toBe(false)
   })
 
+  for (const { symlinks, code, canRestore } of [
+    { symlinks: false, code: 'ENOSYS', canRestore: true },
+    { symlinks: false, code: 'ENOTSUP', canRestore: true },
+    { symlinks: false, code: 'EOPNOTSUPP', canRestore: true },
+    { symlinks: true, code: 'ENOSYS', canRestore: false },
+    { symlinks: false, code: 'EACCES', canRestore: false },
+    { symlinks: false, code: 'EPERM', canRestore: false },
+  ]) {
+    it(`handles symlink restoration errors during abort (symlinks=${symlinks}, code=${code})`, async () => {
+      const original = file('old-target', '120000')
+      const fixture = await prepare(makeFixture, {
+        base: { alias: original },
+        ours: { alias: original },
+        theirs: { alias: original },
+      })
+      await setConfig({ ...fixture, path: 'core.symlinks', value: symlinks })
+      const filepath = `${fixture.dir}/alias`
+      await fixture.fs.rm(filepath)
+      await fixture.fs.write(filepath, 'new-target')
+      await add({ ...fixture, filepath: 'alias' })
+      const error = Object.assign(new Error('Cannot create symlink'), { code })
+      fixture.fs.writelink = async function () {
+        throw error
+      }
+      if (!canRestore) {
+        await expect(abortMerge(fixture)).rejects.toBe(error)
+        return
+      }
+      await abortMerge(fixture)
+      expect((await fixture.fs.lstat(filepath)).isFile()).toBe(true)
+      expect((await fixture.fs.read(filepath)).toString()).toBe('old-target')
+      await GitIndexManager.acquire(
+        {
+          fs: fixture.fs,
+          gitdir: fixture.gitdirsmfullpath || fixture.gitdir,
+          cache: {},
+        },
+        index => {
+          expect(index.entriesMap.get('alias').mode).toBe(0o120000)
+        }
+      )
+    })
+  }
+
   for (const nonBlocking of [false, true]) {
     for (const operation of ['update', 'delete']) {
       for (const force of [false, true]) {
@@ -249,6 +293,7 @@ export function testMergeRecovery(makeFixture) {
       for (const { target, content, autocrlf } of [
         { target: 'local-target', content: 'local-target', autocrlf: false },
         { target: 'local-target', content: 'edited-target', autocrlf: false },
+        { target: 'local-target', content: 'remote-target', autocrlf: false },
         {
           target: 'local\r\ntarget',
           content: 'local\r\ntarget',
@@ -256,7 +301,7 @@ export function testMergeRecovery(makeFixture) {
         },
         { target: 'local\ntarget', content: 'local\r\ntarget', autocrlf: true },
       ]) {
-        it(`handles a symlink stub during checkout ${operation} (nonBlocking=${nonBlocking}, clean=${target === content}, autocrlf=${autocrlf})`, async () => {
+        it(`handles a symlink stub during checkout ${operation} (nonBlocking=${nonBlocking}, clean=${target === content}, incoming=${content === 'remote-target'}, autocrlf=${autocrlf})`, async () => {
           const fixture = await prepare(makeFixture, {
             base: { alias: file(target, '120000') },
             ours: { alias: file(target, '120000') },
@@ -277,8 +322,11 @@ export function testMergeRecovery(makeFixture) {
           const indexPath = `${fixture.gitdirsmfullpath || fixture.gitdir}/index`
           const index = await fixture.fs.read(indexPath)
           const options = { ...fixture, ref: 'incoming', nonBlocking }
+          const canCheckout =
+            content === target ||
+            (operation === 'update' && content === 'remote-target')
           const result = checkout({ ...options, dryRun: true })
-          if (content === target) {
+          if (canCheckout) {
             await result
           } else {
             await expect(result).rejects.toMatchObject({
@@ -289,7 +337,7 @@ export function testMergeRecovery(makeFixture) {
           expect(await fixture.fs.read(indexPath)).toEqual(index)
           expect((await fixture.fs.lstat(filepath)).isFile()).toBe(true)
           expect((await fixture.fs.read(filepath)).toString()).toBe(content)
-          if (content === target) {
+          if (canCheckout) {
             await checkout(options)
             if (operation === 'delete') {
               expect(await fixture.fs.exists(filepath)).toBe(false)

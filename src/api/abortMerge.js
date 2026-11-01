@@ -7,6 +7,7 @@ import { WORKDIR } from '../commands/WORKDIR.js'
 import { _walk } from '../commands/walk.js'
 import { IndexResetError } from '../errors/IndexResetError.js'
 import { MergeNotSupportedError } from '../errors/MergeNotSupportedError.js'
+import { GitConfigManager } from '../managers/GitConfigManager.js'
 import { GitIndexManager } from '../managers/GitIndexManager.js'
 import { FileSystem } from '../models/FileSystem.js'
 import { assertNoSymlinkInLeadingPath } from '../utils/assertNoSymlinkInLeadingPath.js'
@@ -15,6 +16,8 @@ import { discoverGitdir } from '../utils/discoverGitdir.js'
 import { join } from '../utils/join.js'
 import { modified } from '../utils/modified.js'
 
+const UNSUPPORTED_SYMLINK_CODES = new Set(['ENOSYS', 'ENOTSUP', 'EOPNOTSUPP'])
+
 /**
  * Abort a merge in progress.
  *
@@ -22,6 +25,7 @@ import { modified } from '../utils/modified.js'
  *
  * Essentially, abortMerge will reset any files affected by merge conflicts to their last known good version at HEAD.
  * Any unstaged changes are saved and any staged changes are reset as well.
+ * If symlink creation is unsupported and `core.symlinks` is false, restore the link target as a regular file while retaining the committed symlink mode in the index.
  *
  * NOTE: The behavior of this command differs slightly from canonical git in that an error will be thrown if a file exists in the index and nowhere else.
  * Canonical git will reset the file and continue aborting the merge in this case.
@@ -56,6 +60,8 @@ export async function abortMerge({
     let unmergedPaths = []
 
     const updatedGitdir = await discoverGitdir({ fsp: fs, dotgit: gitdir })
+    const config = await GitConfigManager.get({ fs, gitdir: updatedGitdir })
+    const symlinks = await config.get('core.symlinks')
     await GitIndexManager.acquire(
       { fs, gitdir: updatedGitdir, cache },
       async function (index) {
@@ -117,9 +123,18 @@ export async function abortMerge({
           const filepath = join(dir, entry.path)
           await assertNoSymlinkInLeadingPath(fs, dir, entry.path)
           await fs.rm(filepath)
-          if (entry.mode === 0o120000)
-            await fs.writelink(filepath, Buffer.from(entry.content))
-          else await fs.write(filepath, entry.content, { mode: entry.mode })
+          if (entry.mode === 0o120000) {
+            try {
+              await fs.writelink(filepath, Buffer.from(entry.content))
+            } catch (err) {
+              if (
+                symlinks !== false ||
+                !UNSUPPORTED_SYMLINK_CODES.has(err.code)
+              )
+                throw err
+              await fs.write(filepath, entry.content)
+            }
+          } else await fs.write(filepath, entry.content, { mode: entry.mode })
           const stats = await fs.lstat(filepath)
           // The committed mode is authoritative; Windows lstat cannot report executable bits.
           stats.mode = entry.mode

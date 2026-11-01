@@ -771,10 +771,12 @@ async function isWorkdirModified({
       stageMode === SYMLINK_MODE &&
       workdirType === REGULAR_FILE_TYPE
     ) {
-      // A stub's raw bytes must match the link target, without text conversion or index refresh.
+      // Compare raw link-target bytes without text conversion or index refresh.
       const object = await fs.read(filepath)
       const { oid } = await hashObject({ type: 'blob', object })
-      return oid !== (await stage.oid())
+      return (
+        oid !== (await stage.oid()) && (!commit || oid !== (await commit.oid()))
+      )
     }
     return true
   }
