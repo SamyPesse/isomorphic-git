@@ -19,6 +19,8 @@ import { flat } from '../utils/flat.js'
 import { resolveCommit } from '../utils/resolveCommit.js'
 import { worthWalking } from '../utils/worthWalking.js'
 
+const FILE_TYPE_MASK = 0o170000
+
 /**
  * @param {object} args
  * @param {import('../models/FileSystem.js').FileSystem} args.fs
@@ -622,9 +624,12 @@ async function analyze({
               if (workdir) {
                 // Note: canonical git only compares with the stage. But we're smart enough
                 // to compare to the stage AND the incoming commit.
+                // Check types before hashing, which can refresh the index with workdir stats.
                 if (
-                  (await workdir.oid()) !== (await stage.oid()) &&
-                  (await workdir.oid()) !== (await commit.oid())
+                  ((await workdir.mode()) & FILE_TYPE_MASK) !==
+                    ((await stage.mode()) & FILE_TYPE_MASK) ||
+                  ((await workdir.oid()) !== (await stage.oid()) &&
+                    (await workdir.oid()) !== (await commit.oid()))
                 ) {
                   if (force) {
                     return [

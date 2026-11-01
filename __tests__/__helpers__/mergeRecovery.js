@@ -166,6 +166,51 @@ export function testMergeRecovery(makeFixture) {
   })
 
   for (const nonBlocking of [false, true]) {
+    for (const force of [false, true]) {
+      it(`protects a local symlink-to-file change during checkout (nonBlocking=${nonBlocking}, force=${force})`, async () => {
+        const fixture = await prepare(makeFixture, {
+          base: { alias: file('local-target', '120000') },
+          ours: { alias: file('local-target', '120000') },
+          theirs: { alias: file('remote-target', '120000') },
+        })
+        const filepath = `${fixture.dir}/alias`
+        await fixture.fs.rm(filepath)
+        await fixture.fs.write(filepath, 'local-target')
+
+        const result = checkout({
+          ...fixture,
+          ref: 'incoming',
+          force,
+          nonBlocking,
+        })
+        if (force) {
+          await result
+          expect((await fixture.fs.readlink(filepath)).toString()).toBe(
+            'remote-target'
+          )
+        } else {
+          await expect(result).rejects.toMatchObject({
+            code: Errors.CheckoutConflictError.code,
+            data: { filepaths: ['alias'] },
+          })
+          expect((await fixture.fs.lstat(filepath)).isFile()).toBe(true)
+          expect((await fixture.fs.read(filepath)).toString()).toBe(
+            'local-target'
+          )
+          await GitIndexManager.acquire(
+            {
+              fs: fixture.fs,
+              gitdir: fixture.gitdirsmfullpath || fixture.gitdir,
+              cache: {},
+            },
+            index => {
+              expect(index.entriesMap.get('alias').mode).toBe(0o120000)
+            }
+          )
+        }
+      })
+    }
+
     it(`replaces a symlink target during checkout (nonBlocking=${nonBlocking})`, async () => {
       const fixture = await prepare(makeFixture, {
         base: { alias: file('base-target', '120000') },
