@@ -3,6 +3,7 @@ import pify from 'pify'
 import { InternalError } from '../errors/InternalError.js'
 import { compareStrings } from '../utils/compareStrings.js'
 import { dirname } from '../utils/dirname.js'
+import { join } from '../utils/join.js'
 import { mkdirp } from '../utils/mkdirp.js'
 import { rmRecursive } from '../utils/rmRecursive.js'
 import { isPromiseLike } from '../utils/types.js'
@@ -89,6 +90,8 @@ export class FileSystem {
 
     /** @type {((oldpath: string, newpath: string) => Promise<void>)|undefined} */
     this._rename = undefined
+    /** @type {boolean|undefined} Whether conformance checking accepted this adapter; undefined until checked. */
+    this._renameCompatible = undefined
 
     const promises = Object.getOwnPropertyDescriptor(fs, 'promises')
     if (promises && promises.enumerable) {
@@ -99,9 +102,63 @@ export class FileSystem {
     this._original_unwrapped_fs = fs
   }
 
-  /** Whether this adapter can replace an existing entry through rename. */
+  /** Whether rename is available and has not failed the symlink-preservation check. */
   get canRename() {
-    return typeof this._rename === 'function'
+    return (
+      typeof this._rename === 'function' && this._renameCompatible !== false
+    )
+  }
+
+  /**
+   * Check source-symlink preservation using only entries in a caller-owned temporary directory.
+   * Incompatible adapters are disabled before they can replace a working file.
+   *
+   * @param {object} args
+   * @param {string} args.directory Empty temporary directory owned by this operation.
+   * @returns {Promise<void>}
+   */
+  async verifyRename({ directory }) {
+    if (this._renameCompatible === true) return
+    const target = join(directory, 'rename-target')
+    const link = join(directory, 'rename-link')
+    const moved = join(directory, 'rename-moved')
+    try {
+      await this.write(target, 'rename probe')
+      try {
+        await this.writelink(link, Buffer.from('rename-target'))
+      } catch (err) {
+        // File-only adapters can rename regular files even when probe symlinks are unavailable.
+        // The actual entry write still enforces symlink support and permissions.
+        if (
+          !['ENOSYS', 'ENOTSUP', 'EOPNOTSUPP', 'EPERM', 'EACCES'].includes(
+            err.code
+          )
+        )
+          throw err
+        this._renameCompatible = true
+        return
+      }
+      const expectedTarget = await this.readlink(link)
+      await this.rename({ oldpath: link, newpath: moved })
+      const stats = await this.lstat(moved)
+      const movedTarget =
+        stats && stats.isSymbolicLink() ? await this.readlink(moved) : null
+      if (
+        !movedTarget ||
+        !expectedTarget ||
+        !movedTarget.equals(expectedTarget)
+      ) {
+        this._renameCompatible = false
+        throw new InternalError(
+          'Filesystem rename does not preserve symbolic links; use a compatible adapter'
+        )
+      }
+      this._renameCompatible = true
+    } finally {
+      await this.rm(link)
+      await this.rm(moved)
+      await this.rm(target)
+    }
   }
 
   /**

@@ -246,3 +246,8 @@ The replacement is prepared in a temporary directory beside the destination, the
 The adapter must preserve the destination if rename fails. Without rename, these replacements reject
 before changing the existing entry. New paths do not require rename. This protects each replaced path;
 checkout and abort are not transactions across all affected files.
+Before replacing an entry, the wrapper probes source-symlink preservation using private temporary
+files. Incompatible implementations such as LightningFS 3.4.2 are rejected before touching the
+destination, including regular-file replacements that would retain overwritten storage records.
+Adapters that cannot create probe symlinks retain ordinary rename support; actual symlink writes
+still enforce their support and permission checks.

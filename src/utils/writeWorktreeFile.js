@@ -45,6 +45,7 @@ export async function writeWorktreeFile({
   await fs._mkdir(tempdir)
   const temppath = join(tempdir, 'replacement')
   try {
+    await fs.verifyRename({ directory: tempdir })
     await writeEntry({
       fs,
       filepath: temppath,
