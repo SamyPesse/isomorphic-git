@@ -15,8 +15,7 @@ import { assertParameter } from '../utils/assertParameter.js'
 import { discoverGitdir } from '../utils/discoverGitdir.js'
 import { join } from '../utils/join.js'
 import { modified } from '../utils/modified.js'
-
-const UNSUPPORTED_SYMLINK_CODES = new Set(['ENOSYS', 'ENOTSUP', 'EOPNOTSUPP'])
+import { writeWorktreeFile } from '../utils/writeWorktreeFile.js'
 
 /**
  * Abort a merge in progress.
@@ -122,19 +121,13 @@ export async function abortMerge({
           if (entry.deleted || entry.type !== 'blob') continue
           const filepath = join(dir, entry.path)
           await assertNoSymlinkInLeadingPath(fs, dir, entry.path)
-          await fs.rm(filepath)
-          if (entry.mode === 0o120000) {
-            try {
-              await fs.writelink(filepath, Buffer.from(entry.content))
-            } catch (err) {
-              if (
-                symlinks !== false ||
-                !UNSUPPORTED_SYMLINK_CODES.has(err.code)
-              )
-                throw err
-              await fs.write(filepath, entry.content)
-            }
-          } else await fs.write(filepath, entry.content, { mode: entry.mode })
+          await writeWorktreeFile({
+            fs,
+            filepath,
+            content: entry.content,
+            mode: entry.mode,
+            allowSymlinkStub: symlinks === false,
+          })
           const stats = await fs.lstat(filepath)
           // The committed mode is authoritative; Windows lstat cannot report executable bits.
           stats.mode = entry.mode

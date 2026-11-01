@@ -1,5 +1,6 @@
 import pify from 'pify'
 
+import { InternalError } from '../errors/InternalError.js'
 import { compareStrings } from '../utils/compareStrings.js'
 import { dirname } from '../utils/dirname.js'
 import { mkdirp } from '../utils/mkdirp.js'
@@ -44,6 +45,11 @@ const commands = [
 ]
 
 function bindFs(target, fs) {
+  if (fs.rename) {
+    target._rename = isPromiseFs(fs)
+      ? fs.rename.bind(fs)
+      : pify(fs.rename.bind(fs))
+  }
   if (isPromiseFs(fs)) {
     for (const command of commands) {
       target[`_${command}`] = fs[command].bind(fs)
@@ -81,6 +87,9 @@ export class FileSystem {
   constructor(fs) {
     if (typeof fs._original_unwrapped_fs !== 'undefined') return fs
 
+    /** @type {((oldpath: string, newpath: string) => Promise<void>)|undefined} */
+    this._rename = undefined
+
     const promises = Object.getOwnPropertyDescriptor(fs, 'promises')
     if (promises && promises.enumerable) {
       bindFs(this, fs.promises)
@@ -88,6 +97,27 @@ export class FileSystem {
       bindFs(this, fs)
     }
     this._original_unwrapped_fs = fs
+  }
+
+  /** Whether this adapter can replace an existing entry through rename. */
+  get canRename() {
+    return typeof this._rename === 'function'
+  }
+
+  /**
+   * Move an entry over its destination without deleting the destination first.
+   *
+   * @param {object} args
+   * @param {string} args.oldpath
+   * @param {string} args.newpath
+   * @returns {Promise<void>}
+   */
+  async rename({ oldpath, newpath }) {
+    if (!this._rename)
+      throw new InternalError(
+        'Replacing existing files requires fs.rename support'
+      )
+    await this._rename(oldpath, newpath)
   }
 
   /**

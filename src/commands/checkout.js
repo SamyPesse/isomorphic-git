@@ -19,6 +19,7 @@ import { assertNoSymlinkInLeadingPath } from '../utils/assertNoSymlinkInLeadingP
 import { flat } from '../utils/flat.js'
 import { resolveCommit } from '../utils/resolveCommit.js'
 import { worthWalking } from '../utils/worthWalking.js'
+import { writeWorktreeFile } from '../utils/writeWorktreeFile.js'
 
 const FILE_TYPE_MASK = 0o170000
 const REGULAR_FILE_TYPE = 0o100000
@@ -326,7 +327,7 @@ export async function _checkout({
                     gitdir,
                     oid,
                   })
-                  if (chmod) {
+                  if (chmod && mode !== SYMLINK_MODE) {
                     // Note: the mode option of fs.write only works when creating files,
                     // not updating them. Since the `fs` plugin doesn't expose `chmod` this
                     // is our only option.
@@ -340,8 +341,12 @@ export async function _checkout({
                     await fs.write(filepath, object, { mode: 0o777 })
                   } else if (mode === 0o120000) {
                     // symlink
-                    await fs.rm(filepath)
-                    await fs.writelink(filepath, object)
+                    await writeWorktreeFile({
+                      fs,
+                      filepath,
+                      content: object,
+                      mode,
+                    })
                   } else {
                     throw new InternalError(
                       `Invalid mode 0o${mode.toString(
@@ -782,7 +787,10 @@ async function isWorkdirModified({
   }
   const oid = await workdir.oid()
   return (
-    oid !== (await stage.oid()) && (!commit || oid !== (await commit.oid()))
+    oid !== (await stage.oid()) &&
+    (!commit ||
+      ((await commit.mode()) & FILE_TYPE_MASK) !== workdirType ||
+      oid !== (await commit.oid()))
   )
 }
 
@@ -794,7 +802,7 @@ async function updateWorkingDir(
   if (method !== 'create-index' && method !== 'mkdir-index') {
     await assertNoSymlinkInLeadingPath(fs, dir, fullpath)
     const { object } = await readObject({ fs, cache, gitdir, oid })
-    if (chmod) {
+    if (chmod && mode !== SYMLINK_MODE) {
       await fs.rm(filepath)
     }
     if (mode === 0o100644) {
@@ -805,8 +813,7 @@ async function updateWorkingDir(
       await fs.write(filepath, object, { mode: 0o777 })
     } else if (mode === 0o120000) {
       // symlink
-      await fs.rm(filepath)
-      await fs.writelink(filepath, object)
+      await writeWorktreeFile({ fs, filepath, content: object, mode })
     } else {
       throw new InternalError(
         `Invalid mode 0o${mode.toString(8)} detected in blob ${oid}`

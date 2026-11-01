@@ -209,12 +209,17 @@ export function testMergeRecovery(makeFixture) {
       await fixture.fs.rm(filepath)
       await fixture.fs.write(filepath, 'new-target')
       await add({ ...fixture, filepath: 'alias' })
+      const indexPath = `${fixture.gitdirsmfullpath || fixture.gitdir}/index`
+      const indexBefore = await fixture.fs.read(indexPath)
       const error = Object.assign(new Error('Cannot create symlink'), { code })
       fixture.fs.writelink = async function () {
         throw error
       }
       if (!canRestore) {
         await expect(abortMerge(fixture)).rejects.toBe(error)
+        expect((await fixture.fs.lstat(filepath)).isFile()).toBe(true)
+        expect((await fixture.fs.read(filepath)).toString()).toBe('new-target')
+        expect(await fixture.fs.read(indexPath)).toEqual(indexBefore)
         return
       }
       await abortMerge(fixture)
@@ -234,6 +239,88 @@ export function testMergeRecovery(makeFixture) {
   }
 
   for (const nonBlocking of [false, true]) {
+    for (const originalType of ['file', 'symlink']) {
+      for (const failure of ['symlink', 'rename', 'missing-rename']) {
+        it(`preserves the destination after checkout failure (nonBlocking=${nonBlocking}, type=${originalType}, failure=${failure})`, async () => {
+          const fixture = await prepare(makeFixture, {
+            base: { alias: file('local-target', '120000') },
+            ours: { alias: file('local-target', '120000') },
+            theirs: { alias: file('remote-target', '120000') },
+          })
+          const filepath = `${fixture.dir}/alias`
+          if (originalType === 'file') {
+            await fixture.fs.rm(filepath)
+            await fixture.fs.write(filepath, 'Keep my draft')
+          }
+          const namesBefore = await fixture.fs.readdir(fixture.dir)
+          const indexPath = `${fixture.gitdirsmfullpath || fixture.gitdir}/index`
+          const indexBefore = await fixture.fs.read(indexPath)
+          const error = Object.assign(new Error('Injected failure'), {
+            code: 'EACCES',
+          })
+          if (failure === 'symlink') {
+            fixture.fs.writelink = async function () {
+              throw error
+            }
+          } else if (failure === 'rename') {
+            fixture.fs._rename = async function () {
+              throw error
+            }
+          } else {
+            fixture.fs._rename = undefined
+          }
+          await expect(
+            checkout({ ...fixture, ref: 'incoming', force: true, nonBlocking })
+          ).rejects.toMatchObject({ code: Errors.MultipleGitError.code })
+          expect(await fixture.fs.readdir(fixture.dir)).toEqual(namesBefore)
+          expect(await fixture.fs.read(indexPath)).toEqual(indexBefore)
+          if (originalType === 'symlink') {
+            expect((await fixture.fs.readlink(filepath)).toString()).toBe(
+              'local-target'
+            )
+          } else {
+            expect((await fixture.fs.lstat(filepath)).isFile()).toBe(true)
+            expect((await fixture.fs.read(filepath)).toString()).toBe(
+              'Keep my draft'
+            )
+          }
+        })
+      }
+    }
+
+    for (const force of [false, true]) {
+      it(`protects a regular-file edit matching an incoming symlink's bytes (nonBlocking=${nonBlocking}, force=${force})`, async () => {
+        const fixture = await prepare(makeFixture, {
+          base: { alias: file('local-target') },
+          ours: { alias: file('local-target') },
+          theirs: { alias: file('edited-target', '120000') },
+        })
+        const filepath = `${fixture.dir}/alias`
+        await fixture.fs.write(filepath, 'edited-target')
+        const result = checkout({
+          ...fixture,
+          ref: 'incoming',
+          nonBlocking,
+          force,
+        })
+        if (force) {
+          await result
+          expect((await fixture.fs.readlink(filepath)).toString()).toBe(
+            'edited-target'
+          )
+        } else {
+          await expect(result).rejects.toMatchObject({
+            code: Errors.CheckoutConflictError.code,
+            data: { filepaths: ['alias'] },
+          })
+          expect((await fixture.fs.lstat(filepath)).isFile()).toBe(true)
+          expect((await fixture.fs.read(filepath)).toString()).toBe(
+            'edited-target'
+          )
+        }
+      })
+    }
+
     for (const operation of ['update', 'delete']) {
       for (const force of [false, true]) {
         it(`handles a local symlink-to-file change during checkout ${operation} (nonBlocking=${nonBlocking}, force=${force})`, async () => {
