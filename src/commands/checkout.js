@@ -570,15 +570,19 @@ async function analyze({
           return ['delete-index', fullpath]
         }
         // Deleted entries
-        // TODO: How to handle if stage type and workdir type mismatch?
+        // TODO: Handle workdir type mismatches for staged trees and submodules.
         case '101': {
           switch (await stage.type()) {
             case 'tree': {
               return ['rmdir-index', fullpath]
             }
             case 'blob': {
-              // Git checks that the workdir.oid === stage.oid before deleting file
-              if ((await stage.oid()) !== (await workdir.oid())) {
+              // Check types before hashing, which can refresh the index with workdir stats.
+              if (
+                ((await stage.mode()) & FILE_TYPE_MASK) !==
+                  ((await workdir.mode()) & FILE_TYPE_MASK) ||
+                (await stage.oid()) !== (await workdir.oid())
+              ) {
                 if (force) {
                   return ['delete', fullpath]
                 } else {

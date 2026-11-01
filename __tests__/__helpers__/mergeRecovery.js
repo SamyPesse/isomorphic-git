@@ -107,30 +107,53 @@ export function testMergeRecovery(makeFixture) {
     await getConflict(fixture)
   })
 
-  it('aborts staged binary changes without losing bytes or executable mode', async () => {
-    const original = file([0, 128, 255], '100755')
-    const fixture = await prepare(makeFixture, {
-      base: { asset: original },
-      ours: { asset: original },
-      theirs: { asset: original },
+  for (const hideExecutableBits of [false, true]) {
+    it(`aborts staged binary changes without losing bytes or executable mode (hideExecutableBits=${hideExecutableBits})`, async () => {
+      const original = file([0, 128, 255], '100755')
+      const fixture = await prepare(makeFixture, {
+        base: { asset: original },
+        ours: { asset: original },
+        theirs: { asset: original },
+      })
+      await fixture.fs.rm(`${fixture.dir}/asset`)
+      await fixture.fs.write(`${fixture.dir}/asset`, Buffer.from([0, 1]), {
+        mode: 0o644,
+      })
+      await add({ ...fixture, filepath: 'asset' })
+      await fixture.fs.write(`${fixture.dir}/draft`, 'Unrelated draft')
+      if (hideExecutableBits) {
+        // Model filesystems such as Windows that cannot report executable bits.
+        const lstat = fixture.fs.lstat.bind(fixture.fs)
+        fixture.fs.lstat = async function (filepath) {
+          const stats = await lstat(filepath)
+          if (stats && filepath === `${fixture.dir}/asset`) stats.mode &= ~0o111
+          return stats
+        }
+      }
+      await abortMerge(fixture)
+      expect([...(await fixture.fs.read(`${fixture.dir}/asset`))]).toEqual([
+        0, 128, 255,
+      ])
+      await GitIndexManager.acquire(
+        {
+          fs: fixture.fs,
+          gitdir: fixture.gitdirsmfullpath || fixture.gitdir,
+          cache: {},
+        },
+        index => {
+          expect(index.entriesMap.get('asset').mode).toBe(0o100755)
+        }
+      )
+      if (!hideExecutableBits && process.platform !== 'win32') {
+        expect(
+          (await fixture.fs.lstat(`${fixture.dir}/asset`)).mode & 0o111
+        ).not.toBe(0)
+      }
+      expect((await fixture.fs.read(`${fixture.dir}/draft`)).toString()).toBe(
+        'Unrelated draft'
+      )
     })
-    await fixture.fs.rm(`${fixture.dir}/asset`)
-    await fixture.fs.write(`${fixture.dir}/asset`, Buffer.from([0, 1]), {
-      mode: 0o644,
-    })
-    await add({ ...fixture, filepath: 'asset' })
-    await fixture.fs.write(`${fixture.dir}/draft`, 'Unrelated draft')
-    await abortMerge(fixture)
-    expect([...(await fixture.fs.read(`${fixture.dir}/asset`))]).toEqual([
-      0, 128, 255,
-    ])
-    expect(
-      (await fixture.fs.lstat(`${fixture.dir}/asset`)).mode & 0o111
-    ).not.toBe(0)
-    expect((await fixture.fs.read(`${fixture.dir}/draft`)).toString()).toBe(
-      'Unrelated draft'
-    )
-  })
+  }
 
   it('restores symlinks without writing through their targets', async () => {
     const original = file('old-target', '120000')
@@ -166,49 +189,58 @@ export function testMergeRecovery(makeFixture) {
   })
 
   for (const nonBlocking of [false, true]) {
-    for (const force of [false, true]) {
-      it(`protects a local symlink-to-file change during checkout (nonBlocking=${nonBlocking}, force=${force})`, async () => {
-        const fixture = await prepare(makeFixture, {
-          base: { alias: file('local-target', '120000') },
-          ours: { alias: file('local-target', '120000') },
-          theirs: { alias: file('remote-target', '120000') },
-        })
-        const filepath = `${fixture.dir}/alias`
-        await fixture.fs.rm(filepath)
-        await fixture.fs.write(filepath, 'local-target')
-
-        const result = checkout({
-          ...fixture,
-          ref: 'incoming',
-          force,
-          nonBlocking,
-        })
-        if (force) {
-          await result
-          expect((await fixture.fs.readlink(filepath)).toString()).toBe(
-            'remote-target'
-          )
-        } else {
-          await expect(result).rejects.toMatchObject({
-            code: Errors.CheckoutConflictError.code,
-            data: { filepaths: ['alias'] },
+    for (const operation of ['update', 'delete']) {
+      for (const force of [false, true]) {
+        it(`handles a local symlink-to-file change during checkout ${operation} (nonBlocking=${nonBlocking}, force=${force})`, async () => {
+          const fixture = await prepare(makeFixture, {
+            base: { alias: file('local-target', '120000') },
+            ours: { alias: file('local-target', '120000') },
+            theirs:
+              operation === 'delete'
+                ? {}
+                : { alias: file('remote-target', '120000') },
           })
-          expect((await fixture.fs.lstat(filepath)).isFile()).toBe(true)
-          expect((await fixture.fs.read(filepath)).toString()).toBe(
-            'local-target'
-          )
-          await GitIndexManager.acquire(
-            {
-              fs: fixture.fs,
-              gitdir: fixture.gitdirsmfullpath || fixture.gitdir,
-              cache: {},
-            },
-            index => {
-              expect(index.entriesMap.get('alias').mode).toBe(0o120000)
+          const filepath = `${fixture.dir}/alias`
+          await fixture.fs.rm(filepath)
+          await fixture.fs.write(filepath, 'local-target')
+
+          const result = checkout({
+            ...fixture,
+            ref: 'incoming',
+            force,
+            nonBlocking,
+          })
+          if (force) {
+            await result
+            if (operation === 'delete') {
+              expect(await fixture.fs.exists(filepath)).toBe(false)
+            } else {
+              expect((await fixture.fs.readlink(filepath)).toString()).toBe(
+                'remote-target'
+              )
             }
-          )
-        }
-      })
+          } else {
+            await expect(result).rejects.toMatchObject({
+              code: Errors.CheckoutConflictError.code,
+              data: { filepaths: ['alias'] },
+            })
+            expect((await fixture.fs.lstat(filepath)).isFile()).toBe(true)
+            expect((await fixture.fs.read(filepath)).toString()).toBe(
+              'local-target'
+            )
+            await GitIndexManager.acquire(
+              {
+                fs: fixture.fs,
+                gitdir: fixture.gitdirsmfullpath || fixture.gitdir,
+                cache: {},
+              },
+              index => {
+                expect(index.entriesMap.get('alias').mode).toBe(0o120000)
+              }
+            )
+          }
+        })
+      }
     }
 
     it(`replaces a symlink target during checkout (nonBlocking=${nonBlocking})`, async () => {

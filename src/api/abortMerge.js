@@ -120,10 +120,13 @@ export async function abortMerge({
           if (entry.mode === 0o120000)
             await fs.writelink(filepath, Buffer.from(entry.content))
           else await fs.write(filepath, entry.content, { mode: entry.mode })
+          const stats = await fs.lstat(filepath)
+          // The committed mode is authoritative; Windows lstat cannot report executable bits.
+          stats.mode = entry.mode
           index.insert({
             filepath: entry.path,
             oid: entry.oid,
-            stats: await fs.lstat(filepath),
+            stats,
           })
         }
       }
